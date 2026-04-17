@@ -3,8 +3,6 @@
 // FIX: voicemail number from env var (not hardcoded)
 // FIX: /metrics endpoint for monitoring
 // FIX [v2.1]: replaced 5x <Pause length="60"> loop with single <Pause length="3600">
-//             The old loop capped calls at 300s; any call near 5min would get hard-hung up
-//             by Twilio when TwiML ran out, even with an active WebSocket.
 
 const express = require('express');
 const twilio  = require('twilio');
@@ -21,21 +19,18 @@ const logger = require('../utils/logger');
 
 const router = express.Router();
 
-// ── FIX: Proper Twilio signature validation ───────────────────
-// Validates X-Twilio-Signature cryptographic header — not spoofable
+// ── Twilio signature validation ───────────────────────────────
 function validateTwilio(req, res, next) {
-  // Skip in development — Twilio can't sign localhost requests
   if (process.env.NODE_ENV !== 'production') return next();
 
   const signature = req.headers['x-twilio-signature'] || '';
   const url       = `${process.env.BASE_URL}${req.originalUrl}`;
 
-  // Must use raw body for validation to work correctly
   const isValid = twilio.validateRequest(
     process.env.TWILIO_AUTH_TOKEN,
     signature,
     url,
-    req.body   // must be parsed URL-encoded body — express.urlencoded() handles this
+    req.body
   );
 
   if (!isValid) {
@@ -59,17 +54,14 @@ router.post('/answered', (req, res) => {
 
   const twiml  = new twilio.twiml.VoiceResponse();
   const start  = twiml.start();
-  const stream = start.stream({
-    url: `wss://${req.headers.host}/call/stream`,
-  });
+const stream = start.stream({
+  url: `wss://${process.env.BASE_URL.replace('https://', '')}/call/stream`,
+});
   stream.parameter({ name: 'callerPhone', value: callerPhone });
   stream.parameter({ name: 'callSid',     value: callSid });
 
-  // FIX [v2.1]: Single 3600s pause instead of 5x 60s loop.
-  // The old 5x60 = 300s cap meant any call approaching 5 minutes would be
-  // hard-terminated by Twilio when TwiML ran out, even with an open WebSocket.
-  // MAX_CALL_SECONDS (default 180s) or handleCallEnd() will end the call
-  // cleanly before this pause ever expires in normal operation.
+  // FIX [v2.1]: Single 3600s pause — old 5×60s loop capped calls at 300s.
+  // MAX_CALL_SECONDS (default 180s) or handleCallEnd() ends the call first.
   twiml.pause({ length: 3600 });
 
   res.type('text/xml').send(twiml.toString());
@@ -88,7 +80,6 @@ router.post('/incoming', validateTwilio, (req, res) => {
   stream.parameter({ name: 'callerPhone', value: callerPhone });
   stream.parameter({ name: 'callSid',     value: callSid });
 
-  // FIX [v2.1]: same single long pause here for consistency
   twiml.pause({ length: 3600 });
 
   res.type('text/xml').send(twiml.toString());
@@ -105,7 +96,6 @@ router.post('/voicemail', validateTwilio, async (req, res) => {
     return res.type('text/xml').send('<Response><Hangup/></Response>');
   }
 
-  // FIX: use env var for callback number — was hardcoded '7337XXXXXX'
   const callbackNumber = process.env.LONO_CALLBACK_NUMBER || process.env.TWILIO_PHONE_NUMBER;
 
   const twiml = new twilio.twiml.VoiceResponse();
@@ -133,7 +123,6 @@ router.post('/status', validateTwilio, async (req, res) => {
     const maxRetries = parseInt(process.env.MAX_RETRIES_PER_NUMBER) || 1;
 
     if (retries < maxRetries) {
-      // FIX: Redis-based retry — not setTimeout (survives restarts)
       await enqueueRetry(To, Date.now() + 30 * 60 * 1000);
       await incrementRetryCount(To);
       logger.info('Retry enqueued', {
@@ -150,7 +139,7 @@ router.post('/status', validateTwilio, async (req, res) => {
   res.sendStatus(200);
 });
 
-// ── GET /metrics — simple monitoring endpoint ─────────────────
+// ── GET /metrics ──────────────────────────────────────────────
 router.get('/metrics', async (req, res) => {
   const key = req.headers['x-api-key'];
   if (!key || key !== process.env.ADMIN_API_KEY) {
@@ -164,7 +153,7 @@ router.get('/metrics', async (req, res) => {
   }
 });
 
-// ── GET /leads — link to Google Sheet ────────────────────────
+// ── GET /leads ────────────────────────────────────────────────
 router.get('/leads', (req, res) => {
   const key = req.headers['x-api-key'];
   if (!key || key !== process.env.ADMIN_API_KEY) {

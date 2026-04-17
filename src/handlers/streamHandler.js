@@ -4,18 +4,21 @@
 // FIX: all noise filters from v1 retained
 // FIX: metrics tracking on every call event
 // FIX [v2.1]: setupDeepgram() moved from 'connected' to 'start' event handler.
-//             On 'connected', callSid and streamSid are both null — any Deepgram
-//             transcript firing before 'start' would call speakToUser with null streamSid
-//             and silently drop the audio. Moving to 'start' ensures both are set first.
-// FIX [v2.1]: Twilio fallback TwiML now re-includes <Start><Stream> so the media stream
-//             is not lost when ElevenLabs fails mid-call. Previously the fallback replaced
-//             TwiML entirely, orphaning the WebSocket and closing the stream.
+// FIX [v2.1]: Twilio fallback TwiML now re-includes <Start><Stream>.
+// FIX [v2.2]: speakToUser() now sends audio as 160-byte (20ms) chunks with proper
+//             Twilio 'mark' events. Previously one giant payload was sent — Twilio
+//             silently truncates large media messages, so callers heard only the first
+//             ~0.5 seconds ("dot lono finance emi") and nothing more.
+//             Each chunk is sent as a separate 'media' message, followed by a 'mark'
+//             event so Twilio knows when playback of each phrase is complete.
+// FIX [v2.2]: isPlayingAudio flag prevents Deepgram transcripts from being processed
+//             while the agent is speaking — stops the agent from interrupting itself.
 
 const WebSocket = require('ws');
 const twilio    = require('twilio');
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 const { getAIResponse, generateCallSummary }    = require('../services/llmService');
-const { textToSpeech }                          = require('../services/ttsService');
+const { textToSpeech, chunkAudio }              = require('../services/ttsService');
 const sessionManager = require('../services/sessionManager');
 const { logCallToSheets, logLeadToSheets }      = require('../services/sheetsService');
 const { sendOwnerCallSummary }                  = require('../services/notificationService');
@@ -28,7 +31,7 @@ const IDLE_TIMEOUT_MS   = (parseInt(process.env.IDLE_TIMEOUT_SECONDS) || 25) * 1
 const DEBOUNCE_MS       = 1200;
 const MIN_TRANSCRIPT    = 8;
 const MIN_CONFIDENCE    = 0.75;
-const MAX_DG_RETRIES    = 3; // FIX: cap Deepgram reconnect attempts
+const MAX_DG_RETRIES    = 3;
 
 const BYE_PATTERNS = [
   'bye', 'goodbye', 'thank you bye', 'thanks bye', 'not interested',
@@ -65,6 +68,47 @@ const TIMEOUT_TEL    = 'సార్, మీ సమయానికి థాం�
 const IDLE_TEL       = 'సార్, మీరు వింటున్నారా? మీకు ఏదైనా సహాయం చేయగలనా సార్?';
 const STT_FAIL_TEL   = 'సార్, కనెక్షన్‌లో సమస్య వస్తోంది. దయచేసి మళ్ళీ కాల్ చేయండి సార్. థాంక్యూ సార్.';
 
+// FIX [v2.2]: Utility — send a single 160-byte mulaw chunk as a Twilio media message
+function sendChunk(ws, streamSid, chunk) {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    event:    'media',
+    streamSid,
+    media: { payload: chunk.toString('base64') },
+  }));
+}
+
+// FIX [v2.2]: Send a Twilio 'mark' event — signals end of an audio sequence.
+// Twilio fires a 'mark' callback on the WebSocket when it finishes playing
+// all audio up to this point, enabling precise turn-taking.
+function sendMark(ws, streamSid, label) {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    event:    'mark',
+    streamSid,
+    mark: { name: label },
+  }));
+}
+
+// FIX [v2.2]: Stream all 160-byte chunks to Twilio with a small inter-chunk delay.
+// The delay (20ms = one mulaw frame duration) paces delivery to match real-time
+// playback speed, preventing Twilio's jitter buffer from overflowing and dropping frames.
+// Without this pacing, sending all chunks synchronously floods the WS send buffer
+// and Twilio drops the excess — resulting in truncated audio.
+async function streamAudioChunks(ws, streamSid, audioBuffer, markLabel) {
+  const chunks = chunkAudio(audioBuffer);
+  logger.debug('Streaming audio', { chunks: chunks.length, bytes: audioBuffer.length, markLabel });
+
+  for (const chunk of chunks) {
+    sendChunk(ws, streamSid, chunk);
+    // 20ms inter-chunk pacing — matches mulaw frame duration at 8kHz
+    await new Promise(r => setTimeout(r, 20));
+  }
+
+  // Send mark after all chunks — Twilio uses this to signal playback complete
+  sendMark(ws, streamSid, markLabel);
+}
+
 function setupStreamHandler(wss) {
   wss.on('connection', (ws) => {
     logger.info('New WebSocket connection');
@@ -72,18 +116,19 @@ function setupStreamHandler(wss) {
     let callSid          = null;
     let callerPhone      = null;
     let dgConnection     = null;
-    let dgRetryCount     = 0;    // FIX: track Deepgram reconnect attempts
+    let dgRetryCount     = 0;
     let isProcessing     = false;
+    let isPlayingAudio   = false; // FIX [v2.2]: block STT processing while agent speaks
     let transcriptBuffer = '';
     let streamSid        = null;
     let sessionEnded     = false;
     let silenceTimer     = null;
     let idleTimer        = null;
     let maxCallTimer     = null;
+    let markCounter      = 0;    // FIX [v2.2]: unique label per mark event
 
     // ── Deepgram — multilingual with retry cap ────────────────
     function setupDeepgram() {
-      // FIX: stop retrying after MAX_DG_RETRIES — no infinite loop
       if (dgRetryCount >= MAX_DG_RETRIES) {
         logger.error('Deepgram max retries reached — ending call gracefully', { callSid });
         speakToUser(STT_FAIL_TEL).then(() => {
@@ -95,9 +140,7 @@ function setupStreamHandler(wss) {
       try {
         dgConnection = deepgramClient.listen.live({
           model:            'nova-2',
-          // FIX: 'multi' not 'te' — detects Telugu, Hindi, English mid-call
-          // Telugu is still primary because prompt forces it
-          language:         'te',
+          language:         'multi',
           smart_format:     true,
           interim_results:  true,
           utterance_end_ms: 1500,
@@ -109,11 +152,16 @@ function setupStreamHandler(wss) {
         });
 
         dgConnection.on(LiveTranscriptionEvents.Open, () => {
-          dgRetryCount = 0; // reset on successful connect
+          dgRetryCount = 0;
           logger.debug('Deepgram open', { callSid });
         });
 
         dgConnection.on(LiveTranscriptionEvents.UtteranceEnd, async () => {
+          // FIX [v2.2]: ignore transcript while agent is speaking — prevents self-interruption
+          if (isPlayingAudio) {
+            transcriptBuffer = '';
+            return;
+          }
           const final = sanitize(transcriptBuffer.trim());
           if (final.length >= MIN_TRANSCRIPT && !isProcessing) {
             clearTimeout(silenceTimer);
@@ -133,6 +181,9 @@ function setupStreamHandler(wss) {
           if (!transcript || !transcript.trim()) return;
           if (confidence < MIN_CONFIDENCE) return;
 
+          // FIX [v2.2]: discard transcript while agent is speaking
+          if (isPlayingAudio) return;
+
           resetIdleTimer();
 
           if (isFinal) {
@@ -142,6 +193,7 @@ function setupStreamHandler(wss) {
 
             clearTimeout(silenceTimer);
             silenceTimer = setTimeout(async () => {
+              if (isPlayingAudio) { transcriptBuffer = ''; return; }
               const final = sanitize(transcriptBuffer.trim());
               transcriptBuffer = '';
               if (final.length >= MIN_TRANSCRIPT && !isProcessing) {
@@ -154,7 +206,6 @@ function setupStreamHandler(wss) {
         dgConnection.on(LiveTranscriptionEvents.Error, (err) => {
           logger.error('Deepgram error', { error: err.message, callSid, dgRetryCount });
           dgRetryCount++;
-          // FIX: retry with backoff, but stop at MAX_DG_RETRIES
           setTimeout(() => {
             if (!sessionEnded) setupDeepgram();
           }, 2000 * dgRetryCount);
@@ -250,6 +301,9 @@ function setupStreamHandler(wss) {
     }
 
     // ── TTS → send audio to caller ────────────────────────────
+    // FIX [v2.2]: Now uses streamAudioChunks() instead of sending one large payload.
+    // Sets isPlayingAudio=true during streaming so Deepgram transcripts are ignored
+    // while the agent is speaking — prevents self-interruption and echo feedback loops.
     async function speakToUser(text, language = 'telugu') {
       if (!text || !streamSid || sessionEnded) return;
       try {
@@ -257,10 +311,7 @@ function setupStreamHandler(wss) {
         if (!result) return;
 
         if (result.isFallback) {
-          // FIX [v2.1]: Fallback TwiML now re-includes <Start><Stream> to keep the
-          // media stream alive. Previously, calling calls(callSid).update() with only
-          // <Say> + <Pause> would replace TwiML entirely — closing the WebSocket and
-          // preventing any further audio from being received or sent.
+          // FIX [v2.1]: re-include <Start><Stream> so media stream survives fallback
           const wsHost = process.env.BASE_URL.replace(/^https?:\/\//, '');
           try {
             await twilioRest.calls(callSid).update({
@@ -279,17 +330,26 @@ function setupStreamHandler(wss) {
         }
 
         if (ws.readyState !== WebSocket.OPEN) return;
-        // The buffer from ttsService is already mulaw 8kHz — send directly.
-        // No conversion needed (ElevenLabs returns ulaw_8000 format now).
+
+        // FIX [v2.2]: Set flag before streaming — blocks STT callbacks during playback
+        isPlayingAudio = true;
         const audioBuffer = Buffer.isBuffer(result) ? result : Buffer.from(result);
-        ws.send(JSON.stringify({
-          event:    'media',
-          streamSid,
-          media: { payload: audioBuffer.toString('base64') },
-        }));
+        const label = `speak-${++markCounter}`;
+
+        try {
+          await streamAudioChunks(ws, streamSid, audioBuffer, label);
+          // Brief settling time after last chunk before re-enabling STT
+          // Prevents the tail of TTS audio from being picked up as caller speech
+          await new Promise(r => setTimeout(r, 300));
+        } finally {
+          // FIX [v2.2]: Always re-enable STT even if streaming throws
+          isPlayingAudio = false;
+          logger.debug('Audio playback complete', { label, callSid });
+        }
 
       } catch (err) {
         logger.error('speakToUser error', { error: err.message });
+        isPlayingAudio = false;
       }
     }
 
@@ -351,12 +411,7 @@ function setupStreamHandler(wss) {
 
         switch (msg.event) {
           case 'connected':
-            // FIX [v2.1]: Do NOT call setupDeepgram() here.
-            // On 'connected', callSid and streamSid are still null.
-            // Any Deepgram transcript arriving before 'start' would invoke
-            // speakToUser(streamSid=null) and silently discard audio.
-            // Deepgram is now started in the 'start' handler after callSid
-            // and streamSid are both assigned.
+            // FIX [v2.1]: setupDeepgram moved to 'start' — callSid/streamSid null here
             logger.debug('Twilio stream connected — waiting for start event');
             break;
 
@@ -374,9 +429,7 @@ function setupStreamHandler(wss) {
               logger.error('Session create failed', { error: err.message });
             }
 
-            // FIX [v2.1]: setupDeepgram() moved here from 'connected' handler.
-            // callSid and streamSid are now guaranteed to be set before
-            // Deepgram opens and any transcript callbacks can fire.
+            // FIX [v2.1]: Deepgram now started here — callSid and streamSid are set
             setupDeepgram();
 
             maxCallTimer = setTimeout(async () => {
@@ -404,6 +457,11 @@ function setupStreamHandler(wss) {
                 logger.error('Deepgram send error', { error: err.message });
               }
             }
+            break;
+
+          // FIX [v2.2]: Handle Twilio 'mark' acknowledgement — logged for debugging
+          case 'mark':
+            logger.debug('Twilio mark received', { name: msg.mark?.name, callSid });
             break;
 
           case 'stop':
