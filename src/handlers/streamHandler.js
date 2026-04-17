@@ -1,7 +1,7 @@
 // src/handlers/streamHandler.js
-// FIX CRITICAL: speakToUser() now calls chunkAudio() and sends 160-byte frames
-//               Previously sent entire buffer as one payload — Twilio truncated it
-//               causing only first ~0.5s of audio to play ("dot lono finance emi")
+// FIX CRITICAL: speakToUser() calls chunkAudio() and sends 160-byte frames with 20ms delay
+//               Previously sent chunks with no delay — Twilio flooded and dropped audio
+// FIX: Deepgram language set to 'te' (Telugu) — 'multi' was mangling Telugu as English
 // All other fixes from v2.1 retained
 
 const WebSocket = require('ws');
@@ -49,6 +49,12 @@ function escapeXml(str) {
     .replace(/'/g, '&apos;');
 }
 
+// 20ms delay between audio chunks — matches mulaw 8kHz frame timing
+// Without this Twilio receives all frames simultaneously and drops most
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 const activeConnections = new Map();
 const twilioRest = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
@@ -87,7 +93,8 @@ function setupStreamHandler(wss) {
       try {
         dgConnection = deepgramClient.listen.live({
           model:            'nova-2',
-          language:         'multi',
+          // FIX: 'te' not 'multi' — 'multi' mis-transcribes Telugu as garbled English
+          language:         'te',
           smart_format:     true,
           interim_results:  true,
           utterance_end_ms: 1500,
@@ -239,9 +246,8 @@ function setupStreamHandler(wss) {
     }
 
     // ── TTS → send audio chunks to caller ────────────────────
-    // FIX CRITICAL: chunkAudio() now called — splits buffer into 160-byte (20ms) frames
-    // Twilio silently truncates large single-payload media messages
-    // Without chunking: only first ~0.5s plays, rest is dropped
+    // Chunks sent with 20ms delay each — matches mulaw 8kHz frame timing
+    // Twilio requires real-time pacing; flooding all chunks at once causes truncation
     async function speakToUser(text, language = 'telugu') {
       if (!text || !streamSid || sessionEnded) return;
 
@@ -253,11 +259,12 @@ function setupStreamHandler(wss) {
         if (result.isFallback) {
           logger.info('Twilio <Say> fallback TTS', { callSid });
           try {
+            const wsHost = process.env.BASE_URL.replace(/^https?:\/\//, '');
             await twilioRest.calls(callSid).update({
               twiml: [
                 '<Response>',
                 `  <Say voice="${result.voice}" language="${result.langCode}">${escapeXml(result.text)}</Say>`,
-                `  <Start><Stream url="wss://${process.env.BASE_URL.replace(/^https?:\/\//, '')}/call/stream"/></Start>`,
+                `  <Start><Stream url="wss://${wsHost}/call/stream"/></Start>`,
                 '  <Pause length="3600"/>',
                 '</Response>',
               ].join(''),
@@ -270,9 +277,7 @@ function setupStreamHandler(wss) {
 
         if (ws.readyState !== WebSocket.OPEN) return;
 
-        // FIX CRITICAL: chunk the mulaw buffer into 160-byte frames (20ms each)
-        // and send each as a separate WebSocket message
-        // Twilio processes each 20ms chunk through its audio pipeline correctly
+        // Split into 160-byte (20ms) mulaw frames and pace them in real time
         const chunks = chunkAudio(result);
         for (const chunk of chunks) {
           if (ws.readyState !== WebSocket.OPEN) break;
@@ -282,6 +287,9 @@ function setupStreamHandler(wss) {
             streamSid,
             media: { payload: chunk.toString('base64') },
           }));
+          // FIX: 20ms delay between frames — Twilio mulaw 8kHz = 160 bytes per 20ms
+          // Without this delay all frames arrive simultaneously and Twilio drops them
+          await sleep(20);
         }
 
         logger.debug('Audio sent chunked', {
@@ -381,7 +389,7 @@ function setupStreamHandler(wss) {
               setTimeout(() => handleCallEnd('max_duration'), 3000);
             }, MAX_CALL_SECONDS * 1000);
 
-            // Greet after 1200ms — stream stabilize
+            // Greet after 1200ms — let stream stabilise first
             setTimeout(async () => {
               try {
                 await speakToUser(GREETING);
