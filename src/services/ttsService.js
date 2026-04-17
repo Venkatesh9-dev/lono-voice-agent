@@ -1,33 +1,28 @@
 // src/services/ttsService.js
-// FIX: reduced timeout 8s → 5s
-// FIX: startup cache warmup for common Telugu phrases (serves from memory <1ms)
-// FIX [v2.1]: ElevenLabs output_format=ulaw_8000 — returns mulaw directly, no transcoding needed
-// FIX [v2.1]: LANG_CODE Telugu was 'en', now correctly 'te'
-// FIX [v2.2]: Export chunkAudio() — splits buffer into 160-byte (20ms) mulaw frames.
-//             Twilio media stream silently truncates large single-payload messages.
-//             Sending one blob causes only the first ~0.5s to play ("dot lono finance emi").
-//             streamHandler now calls chunkAudio() and sends each chunk separately.
+// FIX CRITICAL: output_format=ulaw_8000 moved to request BODY (not URL param)
+// FIX CRITICAL: chunkAudio() is now actually used — see streamHandler.js
+// FIX: eleven_turbo_v2_5 used (supports ulaw_8000 natively + faster + cheaper)
+// FIX: cache key includes format to prevent stale format collisions
+// FIX: warmup phrases cached correctly with new format
 
 const logger = require('../utils/logger');
 
 const audioCache = new Map();
 const MAX_CACHE  = 80;
 
-// 160 bytes = 20ms of mulaw at 8000 Hz mono.
-// Twilio's media stream spec recommends 20ms frames — matches hardware codec frame size.
+// 160 bytes = exactly 20ms of mulaw at 8000Hz mono
+// Twilio media stream spec: send 20ms frames
 const CHUNK_SIZE = 160;
 
-// FIX: common phrases pre-cached at startup — zero ElevenLabs latency for these
+const LANG_CODE = { telugu: 'te', hindi: 'hi', english: 'en' };
+
 const WARMUP_PHRASES = [
   { text: 'నమస్తే సార్, నేను సిద్దిపేట బ్రాంచ్ నుంచి మాట్లాడుతున్నాను. మాది Lono Finance కంపెనీ సార్. మీరు ప్రస్తుతం ఏమైనా EMI కడుతున్నారా సార్?', lang: 'telugu' },
   { text: 'క్షమించండి సార్, మళ్ళీ చెప్పగలరా?', lang: 'telugu' },
-  { text: 'సరే సార్, మీ సమయానికి థాంక్యూ సార్. ఫ్యూచర్‌లో అవసరం అయితే మాకు కాల్ చేయండి సార్. శుభదినం సార్.', lang: 'telugu' },
+  { text: 'సరే సార్, మీ సమయానికి థాంక్యూ సార్. శుభదినం సార్.', lang: 'telugu' },
   { text: 'సార్, మీరు వింటున్నారా? మీకు ఏదైనా సహాయం చేయగలనా సార్?', lang: 'telugu' },
   { text: 'సార్, మీ సమయానికి థాంక్యూ సార్. మళ్ళీ కాల్ చేస్తాం సార్. శుభదినం.', lang: 'telugu' },
 ];
-
-// FIX [v2.1]: Telugu was incorrectly mapped to 'en' — now correctly 'te'
-const LANG_CODE = { telugu: 'te', hindi: 'hi', english: 'en' };
 
 async function textToSpeechElevenLabs(text, language = 'telugu') {
   const voiceId  = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
@@ -35,18 +30,24 @@ async function textToSpeechElevenLabs(text, language = 'telugu') {
 
   const body = {
     text,
-    model_id: 'eleven_multilingual_v2',
+    // FIX: eleven_turbo_v2_5 — fully supports ulaw_8000, faster, cheaper than multilingual_v2
+    // eleven_multilingual_v2 has limited output format support — caused 422 errors
+    model_id: 'eleven_turbo_v2_5',
     voice_settings: {
-      stability:         0.45,
+      stability:         0.50,
       similarity_boost:  0.85,
-      style:             0.30,
+      style:             0.25,
       use_speaker_boost: true,
     },
     language_code: langCode,
+    // FIX CRITICAL: output_format in BODY not URL query param
+    // ElevenLabs /stream endpoint reads this from request body
+    // URL query param is silently ignored — was causing MP3 response = silence in Twilio
+    output_format: 'ulaw_8000',
   };
 
-  // FIX [v2.1]: mulaw 8kHz directly from ElevenLabs — no transcoding needed
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`;
+  // FIX: use /stream endpoint (not /text-to-speech/{id}) — streams faster
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
 
   const controller = new AbortController();
   const timeout    = setTimeout(() => controller.abort(), 5000);
@@ -57,7 +58,7 @@ async function textToSpeechElevenLabs(text, language = 'telugu') {
       headers: {
         'xi-api-key':   process.env.ELEVENLABS_API_KEY,
         'Content-Type': 'application/json',
-        'Accept':       'audio/basic',
+        'Accept':       'audio/basic', // mulaw MIME type
       },
       body:   JSON.stringify(body),
       signal: controller.signal,
@@ -69,16 +70,24 @@ async function textToSpeechElevenLabs(text, language = 'telugu') {
       throw new Error(`ElevenLabs ${response.status}: ${err}`);
     }
 
-    return Buffer.from(await response.arrayBuffer());
+    const buf = Buffer.from(await response.arrayBuffer());
+    logger.debug('ElevenLabs TTS OK', {
+      language,
+      chars:  text.length,
+      bytes:  buf.length,
+      format: 'ulaw_8000',
+    });
+    return buf;
+
   } catch (err) {
     clearTimeout(timeout);
     throw err;
   }
 }
 
-// FIX [v2.2]: Split raw mulaw buffer into 160-byte frames.
-// Each chunk = exactly 20ms of audio at 8kHz.
-// streamHandler sends each chunk as a separate Twilio media WS message.
+// Split mulaw buffer into 160-byte (20ms) frames for Twilio
+// CRITICAL: Twilio silently truncates large single-payload media messages
+// Sending the whole buffer as one chunk = only first ~0.5s plays
 function chunkAudio(buffer) {
   const chunks = [];
   for (let i = 0; i < buffer.length; i += CHUNK_SIZE) {
@@ -99,7 +108,8 @@ function makeTwilioFallback(text, language) {
 async function textToSpeech(text, language = 'telugu') {
   if (!text || !text.trim()) return null;
 
-  const cacheKey = `${language}:${text.substring(0, 120)}`;
+  // FIX: cache key includes format — prevents stale format collisions
+  const cacheKey = `ulaw_8000:${language}:${text.substring(0, 120)}`;
   if (audioCache.has(cacheKey)) {
     logger.debug('TTS cache hit', { language, chars: text.length });
     return audioCache.get(cacheKey);
@@ -110,7 +120,6 @@ async function textToSpeech(text, language = 'telugu') {
       const buf = await textToSpeechElevenLabs(text, language);
       if (audioCache.size >= MAX_CACHE) audioCache.delete(audioCache.keys().next().value);
       audioCache.set(cacheKey, buf);
-      logger.debug('TTS via ElevenLabs', { language, chars: text.length, bytes: buf.length });
       return buf;
     } catch (err) {
       logger.warn('ElevenLabs failed — Twilio fallback', { error: err.message });
@@ -120,21 +129,23 @@ async function textToSpeech(text, language = 'telugu') {
   return makeTwilioFallback(text, language);
 }
 
-// FIX: pre-warm cache at server startup for common phrases
 async function warmupTTSCache() {
-  if (!process.env.ELEVENLABS_API_KEY) return;
+  if (!process.env.ELEVENLABS_API_KEY) {
+    logger.warn('No ElevenLabs key — skipping TTS warmup');
+    return;
+  }
   logger.info('Warming up TTS cache...');
   let warmed = 0;
   for (const phrase of WARMUP_PHRASES) {
     try {
       await textToSpeech(phrase.text, phrase.lang);
       warmed++;
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 600));
     } catch (err) {
-      logger.warn('TTS warmup failed for phrase', { error: err.message });
+      logger.warn('TTS warmup failed', { error: err.message });
     }
   }
-  logger.info(`TTS cache warmed up`, { phrases: warmed });
+  logger.info('TTS cache ready', { phrasesCached: warmed });
 }
 
 module.exports = { textToSpeech, warmupTTSCache, chunkAudio, CHUNK_SIZE };

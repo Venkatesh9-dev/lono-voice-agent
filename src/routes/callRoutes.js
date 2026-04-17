@@ -1,17 +1,16 @@
 // src/routes/callRoutes.js
-// FIX: proper Twilio request signature validation (not just user-agent)
-// FIX: voicemail number from env var (not hardcoded)
-// FIX: /metrics endpoint for monitoring
-// FIX [v2.1]: replaced 5x <Pause length="60"> loop with single <Pause length="3600">
+// FIX CRITICAL: /answered WebSocket URL now uses req.headers.host (not BASE_URL)
+//               BASE_URL may have path/port that breaks wss:// URL construction
+// FIX HIGH: /answered now has validateTwilio middleware — was open to anyone
+// FIX: getDueRetries removed from import (was unused in this file)
 
 const express = require('express');
 const twilio  = require('twilio');
-const { sendMissedCallAlert }  = require('../services/notificationService');
+const { sendMissedCallAlert } = require('../services/notificationService');
 const {
   enqueueRetry,
   getRetryCount,
   incrementRetryCount,
-  getDueRetries,
   getMetrics,
   incrementMetric,
 } = require('../services/sessionManager');
@@ -34,19 +33,18 @@ function validateTwilio(req, res, next) {
   );
 
   if (!isValid) {
-    logger.warn('SECURITY: Invalid Twilio signature rejected', {
+    logger.warn('SECURITY: Invalid Twilio signature', {
       url,
       ip: req.ip,
-      ua: req.headers['user-agent']?.slice(0, 50),
     });
     return res.status(403).send('Forbidden');
   }
-
   next();
 }
 
 // ── POST /call/answered — outbound call connected ─────────────
-router.post('/answered', (req, res) => {
+// FIX: validateTwilio added — was missing, anyone could hit this endpoint
+router.post('/answered', validateTwilio, (req, res) => {
   const callSid     = req.body.CallSid || 'unknown';
   const callerPhone = req.body.To      || 'unknown';
 
@@ -54,20 +52,22 @@ router.post('/answered', (req, res) => {
 
   const twiml  = new twilio.twiml.VoiceResponse();
   const start  = twiml.start();
-const stream = start.stream({
-  url: `wss://${process.env.BASE_URL.replace('https://', '')}/call/stream`,
-});
+  const stream = start.stream({
+    // FIX CRITICAL: use req.headers.host — always correct regardless of BASE_URL format
+    // BASE_URL may have https://, trailing path, or port that breaks wss:// construction
+    // req.headers.host is always just the hostname:port Twilio actually connected to
+    url: `wss://${req.headers.host}/call/stream`,
+  });
   stream.parameter({ name: 'callerPhone', value: callerPhone });
   stream.parameter({ name: 'callSid',     value: callSid });
 
-  // FIX [v2.1]: Single 3600s pause — old 5×60s loop capped calls at 300s.
-  // MAX_CALL_SECONDS (default 180s) or handleCallEnd() ends the call first.
+  // Single long pause — WebSocket or handleCallEnd() ends the call before this expires
   twiml.pause({ length: 3600 });
 
   res.type('text/xml').send(twiml.toString());
 });
 
-// ── POST /call/incoming — inbound (for testing) ───────────────
+// ── POST /call/incoming — inbound (for testing / demo) ────────
 router.post('/incoming', validateTwilio, (req, res) => {
   const callSid     = req.body.CallSid || 'unknown';
   const callerPhone = req.body.From    || 'unknown';
@@ -76,7 +76,9 @@ router.post('/incoming', validateTwilio, (req, res) => {
 
   const twiml  = new twilio.twiml.VoiceResponse();
   const start  = twiml.start();
-  const stream = start.stream({ url: `wss://${req.headers.host}/call/stream` });
+  const stream = start.stream({
+    url: `wss://${req.headers.host}/call/stream`,
+  });
   stream.parameter({ name: 'callerPhone', value: callerPhone });
   stream.parameter({ name: 'callSid',     value: callSid });
 
@@ -87,7 +89,7 @@ router.post('/incoming', validateTwilio, (req, res) => {
 
 // ── POST /call/voicemail — answering machine detected ─────────
 router.post('/voicemail', validateTwilio, async (req, res) => {
-  const { CallSid, To, AnsweredBy } = req.body;
+  const { CallSid, AnsweredBy } = req.body;
 
   logger.info('Answering machine detected', { CallSid, AnsweredBy });
   await incrementMetric('voicemails');
@@ -101,7 +103,7 @@ router.post('/voicemail', validateTwilio, async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   twiml.say(
     { voice: 'Polly.Aditi', language: 'en-IN' },
-    `Hello, this is a call from Lono Finance. We have some important information about your loan EMI. Please call us back at ${callbackNumber}. Thank you.`
+    `Hello, this is a call from Lono Finance. We have important information about your loan EMI. Please call us back at ${callbackNumber}. Thank you.`
   );
   twiml.hangup();
 
