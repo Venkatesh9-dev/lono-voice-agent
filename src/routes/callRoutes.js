@@ -2,6 +2,9 @@
 // FIX: proper Twilio request signature validation (not just user-agent)
 // FIX: voicemail number from env var (not hardcoded)
 // FIX: /metrics endpoint for monitoring
+// FIX [v2.1]: replaced 5x <Pause length="60"> loop with single <Pause length="3600">
+//             The old loop capped calls at 300s; any call near 5min would get hard-hung up
+//             by Twilio when TwiML ran out, even with an active WebSocket.
 
 const express = require('express');
 const twilio  = require('twilio');
@@ -46,6 +49,8 @@ function validateTwilio(req, res, next) {
 
   next();
 }
+
+// ── POST /call/answered — outbound call connected ─────────────
 router.post('/answered', (req, res) => {
   const callSid     = req.body.CallSid || 'unknown';
   const callerPhone = req.body.To      || 'unknown';
@@ -54,13 +59,18 @@ router.post('/answered', (req, res) => {
 
   const twiml  = new twilio.twiml.VoiceResponse();
   const start  = twiml.start();
-  const stream = start.stream({ 
-    url: `wss://${req.headers.host}/call/stream` 
+  const stream = start.stream({
+    url: `wss://${req.headers.host}/call/stream`,
   });
   stream.parameter({ name: 'callerPhone', value: callerPhone });
   stream.parameter({ name: 'callSid',     value: callSid });
 
-  for (let i = 0; i < 5; i++) twiml.pause({ length: 60 });
+  // FIX [v2.1]: Single 3600s pause instead of 5x 60s loop.
+  // The old 5x60 = 300s cap meant any call approaching 5 minutes would be
+  // hard-terminated by Twilio when TwiML ran out, even with an open WebSocket.
+  // MAX_CALL_SECONDS (default 180s) or handleCallEnd() will end the call
+  // cleanly before this pause ever expires in normal operation.
+  twiml.pause({ length: 3600 });
 
   res.type('text/xml').send(twiml.toString());
 });
@@ -78,7 +88,8 @@ router.post('/incoming', validateTwilio, (req, res) => {
   stream.parameter({ name: 'callerPhone', value: callerPhone });
   stream.parameter({ name: 'callSid',     value: callSid });
 
-  for (let i = 0; i < 5; i++) twiml.pause({ length: 60 });
+  // FIX [v2.1]: same single long pause here for consistency
+  twiml.pause({ length: 3600 });
 
   res.type('text/xml').send(twiml.toString());
 });

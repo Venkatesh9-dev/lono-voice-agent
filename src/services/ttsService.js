@@ -2,6 +2,8 @@
 // FIX: reduced timeout 8s → 5s
 // FIX: startup cache warmup for common Telugu phrases (serves from memory <1ms)
 // FIX: language_code correctly mapped
+// FIX [v2.1]: ElevenLabs output_format=ulaw_8000 — returns mulaw directly, no transcoding needed
+// FIX [v2.1]: LANG_CODE Telugu was 'en', now correctly 'te'
 
 const logger = require('../utils/logger');
 
@@ -17,7 +19,9 @@ const WARMUP_PHRASES = [
   { text: 'సార్, మీ సమయానికి థాంక్యూ సార్. మళ్ళీ కాల్ చేస్తాం సార్. శుభదినం.', lang: 'telugu' },
 ];
 
- const LANG_CODE = { telugu: 'en', hindi: 'hi', english: 'en' };
+// FIX [v2.1]: Telugu was incorrectly mapped to 'en' — now correctly 'te'
+// ElevenLabs eleven_multilingual_v2 uses ISO 639-1 language codes
+const LANG_CODE = { telugu: 'te', hindi: 'hi', english: 'en' };
 
 async function textToSpeechElevenLabs(text, language = 'telugu') {
   const voiceId  = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
@@ -35,24 +39,28 @@ async function textToSpeechElevenLabs(text, language = 'telugu') {
     language_code: langCode,
   };
 
+  // FIX [v2.1]: Request mulaw 8kHz directly from ElevenLabs via output_format query param.
+  // Twilio Media Streams require mulaw 8kHz — ElevenLabs supports this natively.
+  // Previously we sent raw MP3 bytes which Twilio cannot decode, causing silence/static.
+  // No transcoding library needed — the returned buffer is ready to base64 and send.
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`;
+
   // FIX: reduced from 8s to 5s — fail fast, don't keep caller waiting
   const controller = new AbortController();
   const timeout    = setTimeout(() => controller.abort(), 5000);
 
   try {
-    const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-      {
-        method:  'POST',
-        headers: {
-          'xi-api-key':   process.env.ELEVENLABS_API_KEY,
-          'Content-Type': 'application/json',
-          'Accept':       'audio/mpeg',
-        },
-        body:   JSON.stringify(body),
-        signal: controller.signal,
-      }
-    );
+    const response = await fetch(url, {
+      method:  'POST',
+      headers: {
+        'xi-api-key':   process.env.ELEVENLABS_API_KEY,
+        'Content-Type': 'application/json',
+        // FIX [v2.1]: Accept audio/basic (mulaw) instead of audio/mpeg (mp3)
+        'Accept':       'audio/basic',
+      },
+      body:   JSON.stringify(body),
+      signal: controller.signal,
+    });
     clearTimeout(timeout);
 
     if (!response.ok) {
@@ -60,6 +68,7 @@ async function textToSpeechElevenLabs(text, language = 'telugu') {
       throw new Error(`ElevenLabs ${response.status}: ${err}`);
     }
 
+    // Returned buffer is raw mulaw 8kHz — send directly to Twilio, no conversion needed
     return Buffer.from(await response.arrayBuffer());
   } catch (err) {
     clearTimeout(timeout);

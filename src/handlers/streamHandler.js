@@ -3,6 +3,13 @@
 // FIX: Deepgram language 'multi' not hardcoded 'te' — catches Hindi/English mid-call
 // FIX: all noise filters from v1 retained
 // FIX: metrics tracking on every call event
+// FIX [v2.1]: setupDeepgram() moved from 'connected' to 'start' event handler.
+//             On 'connected', callSid and streamSid are both null — any Deepgram
+//             transcript firing before 'start' would call speakToUser with null streamSid
+//             and silently drop the audio. Moving to 'start' ensures both are set first.
+// FIX [v2.1]: Twilio fallback TwiML now re-includes <Start><Stream> so the media stream
+//             is not lost when ElevenLabs fails mid-call. Previously the fallback replaced
+//             TwiML entirely, orphaning the WebSocket and closing the stream.
 
 const WebSocket = require('ws');
 const twilio    = require('twilio');
@@ -250,9 +257,20 @@ function setupStreamHandler(wss) {
         if (!result) return;
 
         if (result.isFallback) {
+          // FIX [v2.1]: Fallback TwiML now re-includes <Start><Stream> to keep the
+          // media stream alive. Previously, calling calls(callSid).update() with only
+          // <Say> + <Pause> would replace TwiML entirely — closing the WebSocket and
+          // preventing any further audio from being received or sent.
+          const wsHost = process.env.BASE_URL.replace(/^https?:\/\//, '');
           try {
             await twilioRest.calls(callSid).update({
-              twiml: `<Response><Say voice="${result.voice}" language="${result.langCode}">${escapeXml(result.text)}</Say><Pause length="60"/></Response>`
+              twiml: [
+                '<Response>',
+                `  <Say voice="${result.voice}" language="${result.langCode}">${escapeXml(result.text)}</Say>`,
+                `  <Start><Stream url="wss://${wsHost}/call/stream"/></Start>`,
+                '  <Pause length="3600"/>',
+                '</Response>',
+              ].join(''),
             });
           } catch (err) {
             logger.error('Twilio Say fallback failed', { error: err.message });
@@ -261,6 +279,8 @@ function setupStreamHandler(wss) {
         }
 
         if (ws.readyState !== WebSocket.OPEN) return;
+        // The buffer from ttsService is already mulaw 8kHz — send directly.
+        // No conversion needed (ElevenLabs returns ulaw_8000 format now).
         const audioBuffer = Buffer.isBuffer(result) ? result : Buffer.from(result);
         ws.send(JSON.stringify({
           event:    'media',
@@ -331,7 +351,13 @@ function setupStreamHandler(wss) {
 
         switch (msg.event) {
           case 'connected':
-            setupDeepgram();
+            // FIX [v2.1]: Do NOT call setupDeepgram() here.
+            // On 'connected', callSid and streamSid are still null.
+            // Any Deepgram transcript arriving before 'start' would invoke
+            // speakToUser(streamSid=null) and silently discard audio.
+            // Deepgram is now started in the 'start' handler after callSid
+            // and streamSid are both assigned.
+            logger.debug('Twilio stream connected — waiting for start event');
             break;
 
           case 'start':
@@ -347,6 +373,11 @@ function setupStreamHandler(wss) {
             } catch (err) {
               logger.error('Session create failed', { error: err.message });
             }
+
+            // FIX [v2.1]: setupDeepgram() moved here from 'connected' handler.
+            // callSid and streamSid are now guaranteed to be set before
+            // Deepgram opens and any transcript callbacks can fire.
+            setupDeepgram();
 
             maxCallTimer = setTimeout(async () => {
               if (sessionEnded) return;

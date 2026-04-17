@@ -2,6 +2,10 @@
 // FIX: correct Claude model name — claude-3-5-haiku-20241022
 // FIX: max_tokens 120 for natural Telugu responses (was too short at 100)
 // FIX: response length guidance in prompt context
+// FIX [v2.1]: max_tokens increased from 120 → 250.
+//             Telugu is morphologically rich — 120 tokens frequently truncates mid-sentence.
+//             A truncated response is sent to ElevenLabs which speaks an incomplete phrase,
+//             confusing the caller and breaking conversational flow.
 
 const Anthropic = require('@anthropic-ai/sdk');
 const { buildLonoPrompt } = require('../config/prompt');
@@ -48,7 +52,14 @@ async function getAIResponse(session, userTranscript) {
   try {
     const response = await anthropic.messages.create({
       model:      MODEL,
-      max_tokens: 120,
+      // FIX [v2.1]: Increased from 120 → 250 tokens.
+      // Telugu script uses more tokens per spoken syllable than English.
+      // At 120 tokens Claude was frequently cutting off mid-sentence —
+      // ElevenLabs would then speak the incomplete text verbatim, which
+      // sounds broken and erodes caller trust. 250 gives enough headroom
+      // for a full 2–3 sentence Telugu conversational turn while keeping
+      // latency low (Haiku is fast enough that this does not add perceptible delay).
+      max_tokens: 250,
       system:     systemPrompt,
       messages:   [
         ...recentMessages,
