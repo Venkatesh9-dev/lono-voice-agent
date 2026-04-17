@@ -12,7 +12,7 @@ const { buildLonoPrompt } = require('../config/prompt');
 const logger = require('../utils/logger');
 
 // FIX: verified stable model string — was 'claude-haiku-4-5-20251001' (invalid)
-const MODEL = 'claude-3-5-haiku-20241022';
+const MODEL = 'claude-haiku-4-5-20251001'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 

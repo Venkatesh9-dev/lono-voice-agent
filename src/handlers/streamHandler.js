@@ -97,7 +97,7 @@ function setupStreamHandler(wss) {
           model:            'nova-2',
           // FIX: 'multi' not 'te' — detects Telugu, Hindi, English mid-call
           // Telugu is still primary because prompt forces it
-          language:         'multi',
+          language:         'te',
           smart_format:     true,
           interim_results:  true,
           utterance_end_ms: 1500,
