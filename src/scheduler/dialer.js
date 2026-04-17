@@ -22,7 +22,7 @@ const {
 
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-const START_HOUR    = parseInt(process.env.CALLING_START_HOUR) || 7;
+const START_HOUR    = parseInt(process.env.CALLING_START_HOUR) || 0;
 const END_HOUR      = parseInt(process.env.CALLING_END_HOUR)   || 24;
 const MAX_RETRIES   = parseInt(process.env.MAX_RETRIES_PER_NUMBER) || 1;
 
