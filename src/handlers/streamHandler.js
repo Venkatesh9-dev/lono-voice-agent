@@ -257,7 +257,11 @@ function setupStreamHandler(wss) {
 
         // ElevenLabs unavailable — use Twilio REST <Say> fallback
         if (result.isFallback) {
-          logger.info('Twilio <Say> fallback TTS', { callSid });
+          logger.warn('⚠️  USING TWILIO FALLBACK (Polly.Aditi) - ElevenLabs failed or misconfigured', {
+            callSid,
+            textLength: text.length,
+            language,
+          });
           try {
             const wsHost = process.env.BASE_URL.replace(/^https?:\/\//, '');
             await twilioRest.calls(callSid).update({

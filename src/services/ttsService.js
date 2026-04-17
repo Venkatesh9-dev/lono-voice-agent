@@ -28,6 +28,10 @@ async function textToSpeechElevenLabs(text, language = 'telugu') {
   const voiceId  = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
   const langCode = LANG_CODE[language] || 'te';
 
+  if (!process.env.ELEVENLABS_VOICE_ID) {
+    logger.warn('ELEVENLABS_VOICE_ID not set — using default voice', { defaultVoiceId: voiceId });
+  }
+
   const body = {
     text,
     // FIX: eleven_turbo_v2_5 — fully supports ulaw_8000, faster, cheaper than multilingual_v2
@@ -48,15 +52,28 @@ async function textToSpeechElevenLabs(text, language = 'telugu') {
 
   // FIX: use /stream endpoint (not /text-to-speech/{id}) — streams faster
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
+  logger.debug('ElevenLabs request', {
+    voiceId,
+    textLength: text.length,
+    language,
+    langCode,
+    model: body.model_id,
+    outputFormat: body.output_format,
+  });
 
   const controller = new AbortController();
   const timeout    = setTimeout(() => controller.abort(), 5000);
 
   try {
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+    if (!apiKey) {
+      throw new Error('ELEVENLABS_API_KEY not set in environment');
+    }
+
     const response = await fetch(url, {
       method:  'POST',
       headers: {
-        'xi-api-key':   process.env.ELEVENLABS_API_KEY,
+        'xi-api-key':   apiKey,
         'Content-Type': 'application/json',
         'Accept':       'audio/basic', // mulaw MIME type
       },
@@ -66,15 +83,34 @@ async function textToSpeechElevenLabs(text, language = 'telugu') {
     clearTimeout(timeout);
 
     if (!response.ok) {
-      const err = await response.text();
-      throw new Error(`ElevenLabs ${response.status}: ${err}`);
+      const errorText = await response.text();
+      const errMsg = `ElevenLabs ${response.status}: ${errorText}`;
+      logger.error('ElevenLabs API error', {
+        status: response.status,
+        error: errorText,
+        voiceId,
+        language,
+        model: body.model_id,
+      });
+      throw new Error(errMsg);
     }
 
-    const buf = Buffer.from(await response.arrayBuffer());
-    logger.debug('ElevenLabs TTS OK', {
+    const arrayBuffer = await response.arrayBuffer();
+    if (!arrayBuffer || arrayBuffer.byteLength === 0) {
+      logger.error('ElevenLabs returned empty audio buffer', {
+        voiceId,
+        language,
+        textLength: text.length,
+      });
+      throw new Error('ElevenLabs returned empty audio buffer');
+    }
+
+    const buf = Buffer.from(arrayBuffer);
+    logger.info('ElevenLabs TTS success', {
+      voiceId,
       language,
-      chars:  text.length,
-      bytes:  buf.length,
+      textLength: text.length,
+      audioBytes: buf.length,
       format: 'ulaw_8000',
     });
     return buf;
@@ -115,18 +151,28 @@ async function textToSpeech(text, language = 'telugu') {
     return audioCache.get(cacheKey);
   }
 
-  if (process.env.ELEVENLABS_API_KEY) {
-    try {
-      const buf = await textToSpeechElevenLabs(text, language);
-      if (audioCache.size >= MAX_CACHE) audioCache.delete(audioCache.keys().next().value);
-      audioCache.set(cacheKey, buf);
-      return buf;
-    } catch (err) {
-      logger.warn('ElevenLabs failed — Twilio fallback', { error: err.message });
-    }
+  if (!process.env.ELEVENLABS_API_KEY) {
+    logger.warn('ELEVENLABS_API_KEY not configured — using Twilio fallback', {
+      language,
+      textLength: text.length,
+    });
+    return makeTwilioFallback(text, language);
   }
 
-  return makeTwilioFallback(text, language);
+  try {
+    const buf = await textToSpeechElevenLabs(text, language);
+    if (audioCache.size >= MAX_CACHE) audioCache.delete(audioCache.keys().next().value);
+    audioCache.set(cacheKey, buf);
+    return buf;
+  } catch (err) {
+    logger.error('ElevenLabs TTS failed — falling back to Twilio <Say>', {
+      error: err.message,
+      language,
+      textLength: text.length,
+      voiceId: process.env.ELEVENLABS_VOICE_ID || 'default',
+    });
+    return makeTwilioFallback(text, language);
+  }
 }
 
 async function warmupTTSCache() {
