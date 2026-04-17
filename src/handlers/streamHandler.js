@@ -261,10 +261,11 @@ function setupStreamHandler(wss) {
         }
 
         if (ws.readyState !== WebSocket.OPEN) return;
+        const audioBuffer = Buffer.isBuffer(result) ? result : Buffer.from(result);
         ws.send(JSON.stringify({
           event:    'media',
           streamSid,
-          media: { payload: result.toString('base64') },
+          media: { payload: audioBuffer.toString('base64') },
         }));
 
       } catch (err) {

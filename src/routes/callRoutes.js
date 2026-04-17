@@ -46,14 +46,21 @@ function validateTwilio(req, res, next) {
 
   next();
 }
-
 router.post('/answered', (req, res) => {
-  const twiml = new (require('twilio')).twiml.VoiceResponse();
+  const callSid     = req.body.CallSid || 'unknown';
+  const callerPhone = req.body.To      || 'unknown';
 
-  twiml.say(
-    { voice: 'Polly.Aditi', language: 'en-IN' },
-    'Hello Chinna, your system is working perfectly.'
-  );
+  logger.info('Outbound call answered', { callSid });
+
+  const twiml  = new twilio.twiml.VoiceResponse();
+  const start  = twiml.start();
+  const stream = start.stream({ 
+    url: `wss://${req.headers.host}/call/stream` 
+  });
+  stream.parameter({ name: 'callerPhone', value: callerPhone });
+  stream.parameter({ name: 'callSid',     value: callSid });
+
+  for (let i = 0; i < 5; i++) twiml.pause({ length: 60 });
 
   res.type('text/xml').send(twiml.toString());
 });
