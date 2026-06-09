@@ -1,16 +1,17 @@
 // src/handlers/streamHandler.js
 //
-// REWRITE: Deepgram removed — replaced with ElevenLabs Scribe STT
-// ElevenLabs handles both TTS and STT — no third-party STT service needed.
+// MULTILINGUAL: Telugu (primary) + Hindi + English
+// STT  — ElevenLabs Scribe, auto language detection (no language_code lock)
+// TTS  — ElevenLabs, language matched to what the caller spoke
+// LLM  — Claude responds in detected caller language
 //
-// STT pipeline:
-//   Twilio µ-law audio → energy VAD → silence detected →
-//   µ-law decode → WAV packaging → ElevenLabs Scribe API → transcript
+// Language detection:
+//   Telugu  → Unicode U+0C00–U+0C7F dominant
+//   Hindi   → Unicode U+0900–U+097F dominant
+//   English → fallback
 //
-// Why this works:
-//   ElevenLabs Scribe (scribe_v1) supports Telugu, accepts WAV, returns text.
-//   VAD (voice activity detection) buffers speech and flushes on silence.
-//   No WebSocket STT connection = no connection failures, no retries, no drops.
+// Language is detected per utterance and stored in session.
+// Greeting is always Telugu (outbound Telugu market), then adapts to caller.
 
 const WebSocket = require('ws');
 const twilio    = require('twilio');
@@ -26,17 +27,20 @@ const IDLE_TIMEOUT_MS  = (parseInt(process.env.IDLE_TIMEOUT_SECONDS) || 25) * 10
 const MIN_TRANSCRIPT   = 3;
 
 // ── VAD tuning ────────────────────────────────────────────────
-// Twilio µ-law 8 kHz mono — 160 bytes per 20 ms frame
-// RMS energy of decoded PCM: silence ≈ 0–100, soft speech ≈ 200–800, normal ≈ 800+
-const SILENCE_THRESHOLD_RMS  = 250; // below = silence; tune up if false triggers
-const MIN_SPEECH_MS           = 300; // ignore utterances shorter than this
-const SILENCE_TO_END_MS       = 800; // silence duration that ends an utterance
+const SILENCE_THRESHOLD_RMS = 250; // RMS energy below this = silence
+const MIN_SPEECH_MS          = 300; // skip utterances shorter than this
+const SILENCE_TO_END_MS      = 800; // silence duration to flush utterance
 
+// ── BYE detection (all three languages) ──────────────────────
 const BYE_PATTERNS = [
-  'bye', 'goodbye', 'thank you bye', 'thanks bye', 'not interested',
-  'no thanks', 'stop calling', "that's all",
-  'సరే సార్', 'థాంక్యూ', 'వద్దు', 'అక్కర్లేదు', 'సెలవు', 'ఇప్పుడు వద్దు',
-  'ठीक है', 'धन्यवाद', 'नहीं चाहिए', 'बाय',
+  // English
+  'bye', 'goodbye', 'not interested', 'no thanks', 'stop calling',
+  "that's all", 'no need',
+  // Telugu
+  'సరే సార్', 'థాంక్యూ', 'వద్దు', 'అక్కర్లేదు', 'సెలవు',
+  'ఇప్పుడు వద్దు', 'వెళ్తాను',
+  // Hindi
+  'ठीक है', 'धन्यवाद', 'नहीं चाहिए', 'बाय', 'नहीं', 'छोड़िए',
 ];
 
 function detectBye(text) {
@@ -53,6 +57,43 @@ function sanitize(text) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ── Language detection from transcript ───────────────────────
+// Counts Unicode character blocks and picks the dominant script.
+function detectLanguage(text) {
+  const teluguChars = (text.match(/[\u0C00-\u0C7F]/g) || []).length;
+  const hindiChars  = (text.match(/[\u0900-\u097F]/g) || []).length;
+  const total       = text.replace(/\s+/g, '').length || 1;
+
+  const teluguRatio = teluguChars / total;
+  const hindiRatio  = hindiChars  / total;
+
+  if (teluguRatio > 0.25) return 'telugu';
+  if (hindiRatio  > 0.25) return 'hindi';
+  return 'english';
+}
+
+// ── Per-language agent messages ───────────────────────────────
+const MESSAGES = {
+  telugu: {
+    goodbye: 'సరే సార్, మీ సమయానికి థాంక్యూ సార్. ఫ్యూచర్‌లో అవసరం అయితే మాకు కాల్ చేయండి సార్. శుభదినం సార్.',
+    timeout: 'సార్, మీ సమయానికి థాంక్యూ సార్. మళ్ళీ కాల్ చేస్తాం సార్. శుభదినం.',
+    idle:    'సార్, మీరు వింటున్నారా? మీకు ఏదైనా సహాయం చేయగలనా సార్?',
+  },
+  hindi: {
+    goodbye: 'ठीक है सर, आपके समय के लिए धन्यवाद। भविष्य में जरूरत हो तो हमें कॉल करें। शुभ दिन सर।',
+    timeout: 'सर, आपके समय के लिए धन्यवाद। हम फिर कॉल करेंगे। शुभ दिन।',
+    idle:    'सर, क्या आप सुन रहे हैं? क्या मैं आपकी कोई मदद कर सकता हूँ?',
+  },
+  english: {
+    goodbye: 'Okay sir, thank you for your time. Please call us if you need anything in the future. Have a good day sir.',
+    timeout: 'Sir, thank you for your time. We will call again. Have a good day.',
+    idle:    'Sir, are you there? Can I help you with anything?',
+  },
+};
+
+// Greeting is always Telugu — outbound agent targets Telugu market
+const GREETING = 'నమస్తే సార్, నేను సిద్దిపేట బ్రాంచ్ నుంచి మాట్లాడుతున్నాను. మాది Lono Finance కంపెనీ సార్. మీరు ప్రస్తుతం ఏమైనా EMI కడుతున్నారా సార్?';
+
 // ── µ-law decode ──────────────────────────────────────────────
 function ulawToLinear(uVal) {
   uVal = ~uVal & 0xFF;
@@ -67,21 +108,18 @@ function ulawToLinear(uVal) {
 // ── RMS energy of a µ-law buffer ──────────────────────────────
 function getRmsEnergy(buf) {
   let sum = 0;
-  for (const byte of buf) {
-    const s = ulawToLinear(byte);
-    sum += s * s;
-  }
+  for (const byte of buf) { const s = ulawToLinear(byte); sum += s * s; }
   return Math.sqrt(sum / buf.length);
 }
 
-// ── µ-law buffer → WAV buffer ─────────────────────────────────
+// ── µ-law buffer → WAV buffer (16-bit PCM, 8 kHz mono) ───────
 function buildWav(ulawBuf) {
   const sampleRate    = 8000;
   const numChannels   = 1;
   const bitsPerSample = 16;
   const byteRate      = sampleRate * numChannels * bitsPerSample / 8;
   const blockAlign    = numChannels * bitsPerSample / 8;
-  const dataSize      = ulawBuf.length * 2; // 16-bit = 2 bytes
+  const dataSize      = ulawBuf.length * 2;
 
   const header = Buffer.alloc(44);
   header.write('RIFF', 0);
@@ -89,7 +127,7 @@ function buildWav(ulawBuf) {
   header.write('WAVE', 8);
   header.write('fmt ', 12);
   header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);              // PCM
+  header.writeUInt16LE(1, 20);
   header.writeUInt16LE(numChannels, 22);
   header.writeUInt32LE(sampleRate, 24);
   header.writeUInt32LE(byteRate, 28);
@@ -105,10 +143,11 @@ function buildWav(ulawBuf) {
   return Buffer.concat([header, pcm]);
 }
 
-// ── ElevenLabs Scribe STT call ────────────────────────────────
+// ── ElevenLabs Scribe STT — NO language_code lock ─────────────
+// Auto-detect language so Telugu, Hindi, and English all work correctly.
 async function elevenLabsSTT(ulawBuf) {
-  const wavBuf    = buildWav(ulawBuf);
-  const boundary  = 'EL' + Date.now().toString(36);
+  const wavBuf   = buildWav(ulawBuf);
+  const boundary = 'EL' + Date.now().toString(36);
 
   const parts = [
     Buffer.from(
@@ -118,22 +157,18 @@ async function elevenLabsSTT(ulawBuf) {
     ),
     wavBuf,
     Buffer.from('\r\n'),
+    // model
     Buffer.from(
       `--${boundary}\r\n` +
       `Content-Disposition: form-data; name="model_id"\r\n\r\nscribe_v1\r\n`
     ),
-    // Telugu language code — Scribe supports it (unlike TTS API)
-    Buffer.from(
-      `--${boundary}\r\n` +
-      `Content-Disposition: form-data; name="language_code"\r\n\r\nte\r\n`
-    ),
+    // NO language_code — auto-detection handles Telugu/Hindi/English
     Buffer.from(`--${boundary}--\r\n`),
   ];
 
-  const body = Buffer.concat(parts);
-
+  const body       = Buffer.concat(parts);
   const controller = new AbortController();
-  const timeout    = setTimeout(() => controller.abort(), 10000); // 10s STT timeout
+  const timeout    = setTimeout(() => controller.abort(), 10000);
 
   try {
     const response = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
@@ -163,22 +198,19 @@ async function elevenLabsSTT(ulawBuf) {
 const activeConnections = new Map();
 const twilioRest = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-const GREETING    = 'నమస్తే సార్, నేను సిద్దిపేట బ్రాంచ్ నుంచి మాట్లాడుతున్నాను. మాది Lono Finance కంపెనీ సార్. మీరు ప్రస్తుతం ఏమైనా EMI కడుతున్నారా సార్?';
-const GOODBYE_TEL = 'సరే సార్, మీ సమయానికి థాంక్యూ సార్. ఫ్యూచర్‌లో అవసరం అయితే మాకు కాల్ చేయండి సార్. శుభదినం సార్.';
-const TIMEOUT_TEL = 'సార్, మీ సమయానికి థాంక్యూ సార్. మళ్ళీ కాల్ చేస్తాం సార్. శుభదినం.';
-const IDLE_TEL    = 'సార్, మీరు వింటున్నారా? మీకు ఏదైనా సహాయం చేయగలనా సార్?';
-
+// ─────────────────────────────────────────────────────────────
 function setupStreamHandler(wss) {
   wss.on('connection', (ws) => {
     logger.info('New WebSocket connection');
 
-    let callSid      = null;
-    let streamSid    = null;
-    let callerPhone  = null;
-    let sessionEnded = false;
-    let isProcessing = false;
-    let idleTimer    = null;
-    let maxCallTimer = null;
+    let callSid        = null;
+    let streamSid      = null;
+    let callerPhone    = null;
+    let sessionEnded   = false;
+    let isProcessing   = false;
+    let idleTimer      = null;
+    let maxCallTimer   = null;
+    let currentLang    = 'telugu'; // tracks caller's language; updates per utterance
 
     // VAD state
     let speechChunks   = [];
@@ -193,25 +225,25 @@ function setupStreamHandler(wss) {
         if (sessionEnded) return;
         const session = await sessionManager.getSession(callSid);
         if (!session) return;
+        const msgs = MESSAGES[currentLang] || MESSAGES.telugu;
         if ((session.idleWarningsSent || 0) === 0) {
           await sessionManager.updateSession(callSid, { idleWarningsSent: 1 });
-          await speakToUser(IDLE_TEL);
+          await speakToUser(msgs.idle, currentLang);
           resetIdleTimer();
         } else {
-          await speakToUser(TIMEOUT_TEL);
+          await speakToUser(msgs.timeout, currentLang);
           setTimeout(() => handleCallEnd('idle_timeout'), 3000);
         }
       }, IDLE_TIMEOUT_MS);
     }
 
-    // ── VAD: receive one 20ms µ-law frame ─────────────────────
+    // ── VAD: receive one 20 ms µ-law frame ────────────────────
     async function onAudioFrame(audioData) {
       if (isProcessing || sessionEnded) return;
 
       const energy = getRmsEnergy(audioData);
 
       if (energy > SILENCE_THRESHOLD_RMS) {
-        // ── Speech active ──
         if (!isSpeaking) {
           isSpeaking   = true;
           speechChunks = [];
@@ -223,8 +255,7 @@ function setupStreamHandler(wss) {
         resetIdleTimer();
 
       } else if (isSpeaking) {
-        // ── Trailing silence ──
-        speechChunks.push(Buffer.from(audioData)); // keep trailing silence for natural audio
+        speechChunks.push(Buffer.from(audioData));
         clearTimeout(vadTimer);
 
         vadTimer = setTimeout(async () => {
@@ -241,31 +272,48 @@ function setupStreamHandler(wss) {
           const buf = Buffer.concat(speechChunks);
           speechChunks = [];
           logger.info('🎙️  Utterance complete — transcribing', {
-            callSid,
-            ms: duration,
-            bytes: buf.length,
+            callSid, ms: duration, bytes: buf.length,
           });
           await transcribeAndProcess(buf);
         }, SILENCE_TO_END_MS);
       }
     }
 
-    // ── STT → Claude → TTS ────────────────────────────────────
+    // ── STT → language detect → Claude → TTS ─────────────────
     async function transcribeAndProcess(ulawBuf) {
       if (isProcessing || sessionEnded) return;
       isProcessing = true;
       try {
-        logger.info('📤 Calling ElevenLabs STT...', { callSid, bytes: ulawBuf.length });
+        logger.info('📤 Calling ElevenLabs STT (auto-detect language)...', {
+          callSid, bytes: ulawBuf.length,
+        });
+
         const raw = await elevenLabsSTT(ulawBuf);
 
         if (!raw || raw.length < MIN_TRANSCRIPT) {
-          logger.warn('⚠️  Empty transcript, ignoring', { callSid, raw });
+          logger.warn('⚠️  Empty or too short transcript', { callSid, raw });
           return;
         }
 
         const transcript = sanitize(raw);
-        logger.info('✅ STT transcript', { callSid, transcript });
-        await processUserInput(transcript);
+
+        // Detect language and update session
+        const detectedLang = detectLanguage(transcript);
+        if (detectedLang !== currentLang) {
+          logger.info(`🌐 Language switched: ${currentLang} → ${detectedLang}`, {
+            callSid, transcript,
+          });
+          currentLang = detectedLang;
+          await sessionManager.updateSession(callSid, { language: detectedLang });
+        }
+
+        logger.info('✅ STT transcript', {
+          callSid,
+          transcript,
+          detectedLang,
+        });
+
+        await processUserInput(transcript, detectedLang);
 
       } catch (err) {
         logger.error('❌ STT error', { callSid, error: err.message });
@@ -274,14 +322,16 @@ function setupStreamHandler(wss) {
       }
     }
 
-    // ── Transcript → LLM → speak response ────────────────────
-    async function processUserInput(transcript) {
+    // ── Transcript → LLM → speak ──────────────────────────────
+    async function processUserInput(transcript, lang) {
       if (sessionEnded) return;
+      const msgs = MESSAGES[lang] || MESSAGES.telugu;
+
       try {
-        logger.info('📥 Processing user input', { callSid, transcript });
+        logger.info('📥 Processing user input', { callSid, transcript, lang });
 
         if (detectBye(transcript)) {
-          await speakToUser(GOODBYE_TEL);
+          await speakToUser(msgs.goodbye, lang);
           await sessionManager.incrementMetric('calls_completed');
           setTimeout(() => handleCallEnd('caller_ended'), 3500);
           return;
@@ -292,17 +342,20 @@ function setupStreamHandler(wss) {
 
         await sessionManager.addMessage(callSid, 'user', transcript);
 
-        logger.info('🤖 Calling Claude...', { callSid });
+        logger.info('🤖 Calling Claude...', { callSid, lang });
         const aiResult = await getAIResponse(session, transcript);
-        logger.info('✅ Claude response', { callSid, length: aiResult.text.length });
+        logger.info('✅ Claude response', {
+          callSid, length: aiResult.text.length, lang,
+        });
 
         await sessionManager.addMessage(callSid, 'assistant', aiResult.text);
 
         if (aiResult.leadData) {
           await sessionManager.updateSession(callSid, {
-            leadData: { ...(session.leadData || {}), ...aiResult.leadData }
+            leadData: { ...(session.leadData || {}), ...aiResult.leadData },
           });
           await sessionManager.incrementMetric('leads_captured');
+          logger.info('👤 Lead captured', { callSid, leadData: aiResult.leadData });
         }
 
         if (aiResult.status === 'not_interested') {
@@ -311,12 +364,13 @@ function setupStreamHandler(wss) {
         }
 
         if (aiResult.transfer && process.env.ENABLE_HUMAN_TRANSFER === 'true') {
-          await speakToUser(aiResult.text);
+          await speakToUser(aiResult.text, lang);
           await handleTransfer();
           return;
         }
 
-        await speakToUser(aiResult.text);
+        // Respond in detected language
+        await speakToUser(aiResult.text, lang);
 
         if (detectBye(aiResult.text)) {
           setTimeout(() => handleCallEnd('agent_ended'), 4000);
@@ -327,8 +381,9 @@ function setupStreamHandler(wss) {
       }
     }
 
-    // ── TTS → send audio frames to Twilio ────────────────────
-    async function speakToUser(text, language = 'telugu') {
+    // ── TTS → Twilio audio frames ─────────────────────────────
+    // lang: 'telugu' | 'hindi' | 'english' — matched to caller's detected language
+    async function speakToUser(text, lang = 'telugu') {
       if (!text || !streamSid || sessionEnded) {
         logger.warn('⚠️  speakToUser skipped', {
           callSid, hasText: !!text, hasStreamSid: !!streamSid, sessionEnded,
@@ -336,14 +391,16 @@ function setupStreamHandler(wss) {
         return;
       }
       try {
-        logger.info('🎤 Speaking to user', { callSid, textLength: text.length });
-        const buf = await textToSpeech(text, language);
+        logger.info('🎤 Speaking to user', { callSid, lang, textLength: text.length });
+        const buf = await textToSpeech(text, lang);
         if (!buf) return;
 
         if (ws.readyState !== WebSocket.OPEN) return;
 
         const chunks = chunkAudio(buf);
-        logger.info(`📤 Sending ${chunks.length} audio frames to Twilio`, { callSid });
+        logger.info(`📤 Sending ${chunks.length} audio frames`, {
+          callSid, lang, bytes: buf.length,
+        });
 
         for (const chunk of chunks) {
           if (ws.readyState !== WebSocket.OPEN || sessionEnded) break;
@@ -352,12 +409,12 @@ function setupStreamHandler(wss) {
             streamSid,
             media: { payload: chunk.toString('base64') },
           }));
-          await sleep(20); // pace at 8kHz mulaw real-time
+          await sleep(20); // 8 kHz µ-law = 160 bytes per 20 ms
         }
-        logger.info('✅ Audio sent', { callSid, textLength: text.length });
 
+        logger.info('✅ Audio sent', { callSid, lang, textLength: text.length });
       } catch (err) {
-        logger.error('❌ speakToUser error', { callSid, error: err.message });
+        logger.error('❌ speakToUser error', { callSid, lang, error: err.message });
         throw err;
       }
     }
@@ -386,7 +443,9 @@ function setupStreamHandler(wss) {
       logger.info('Call ending', { callSid, reason });
 
       try {
-        await twilioRest.calls(callSid).update({ twiml: '<Response><Hangup/></Response>' });
+        await twilioRest.calls(callSid).update({
+          twiml: '<Response><Hangup/></Response>',
+        });
       } catch (err) {
         logger.warn('Hangup REST failed', { error: err.message });
       }
@@ -422,8 +481,8 @@ function setupStreamHandler(wss) {
             callSid     = msg.start?.callSid;
             streamSid   = msg.start?.streamSid;
             callerPhone = msg.start?.customParameters?.callerPhone || 'unknown';
-            activeConnections.set(callSid, ws);
 
+            activeConnections.set(callSid, ws);
             try {
               await sessionManager.createSession(callSid, callerPhone, true);
               await sessionManager.incrementMetric('calls_answered');
@@ -431,21 +490,21 @@ function setupStreamHandler(wss) {
               logger.error('Session create failed', { error: err.message });
             }
 
-            logger.info('✅ Stream started — ElevenLabs STT+TTS active (no Deepgram)', {
-              callSid,
-              streamSid,
+            logger.info('✅ Stream started — ElevenLabs STT+TTS (multilingual)', {
+              callSid, streamSid,
             });
 
             maxCallTimer = setTimeout(async () => {
               if (sessionEnded) return;
-              await speakToUser(TIMEOUT_TEL);
+              const msgs = MESSAGES[currentLang] || MESSAGES.telugu;
+              await speakToUser(msgs.timeout, currentLang);
               setTimeout(() => handleCallEnd('max_duration'), 3000);
             }, MAX_CALL_SECONDS * 1000);
 
-            // Greet caller after 1200ms (let stream stabilise)
+            // Greet in Telugu after 1200ms
             setTimeout(async () => {
               try {
-                await speakToUser(GREETING);
+                await speakToUser(GREETING, 'telugu');
                 await sessionManager.addMessage(callSid, 'assistant', GREETING);
                 setTimeout(() => resetIdleTimer(), 500);
               } catch (err) {
@@ -456,8 +515,7 @@ function setupStreamHandler(wss) {
 
           case 'media':
             if (msg.media?.payload) {
-              const audioData = Buffer.from(msg.media.payload, 'base64');
-              await onAudioFrame(audioData);
+              await onAudioFrame(Buffer.from(msg.media.payload, 'base64'));
             }
             break;
 
