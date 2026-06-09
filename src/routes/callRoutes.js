@@ -1,8 +1,10 @@
 // src/routes/callRoutes.js
+// FIX CRITICAL: <Start><Stream> → <Connect><Stream> in /answered and /incoming
+//               <Start><Stream> is receive-only — Twilio silently drops all
+//               audio injected back via WebSocket. Agent spoke but caller heard
+//               nothing. <Connect><Stream> enables full bidirectional audio.
 // FIX CRITICAL: /answered WebSocket URL now uses req.headers.host (not BASE_URL)
-//               BASE_URL may have path/port that breaks wss:// URL construction
 // FIX HIGH: /answered now has validateTwilio middleware — was open to anyone
-// FIX: getDueRetries removed from import (was unused in this file)
 
 const express = require('express');
 const twilio  = require('twilio');
@@ -20,10 +22,15 @@ const router = express.Router();
 
 // ── Twilio signature validation ───────────────────────────────
 function validateTwilio(req, res, next) {
-  if (process.env.NODE_ENV !== 'production') return next();
+  if (process.env.NODE_ENV !== 'production') {
+    logger.debug('✅ Skipping Twilio signature validation (development mode)');
+    return next();
+  }
 
   const signature = req.headers['x-twilio-signature'] || '';
   const url       = `${process.env.BASE_URL}${req.originalUrl}`;
+
+  logger.debug('🔐 Validating Twilio signature', { url, signaturePresent: !!signature });
 
   const isValid = twilio.validateRequest(
     process.env.TWILIO_AUTH_TOKEN,
@@ -33,56 +40,63 @@ function validateTwilio(req, res, next) {
   );
 
   if (!isValid) {
-    logger.warn('SECURITY: Invalid Twilio signature', {
+    logger.error('🚨 SECURITY: Invalid Twilio signature detected', {
       url,
       ip: req.ip,
+      signature: signature.substring(0, 20) + '...',
     });
     return res.status(403).send('Forbidden');
   }
+  logger.debug('✅ Twilio signature valid');
   next();
 }
 
 // ── POST /call/answered — outbound call connected ─────────────
-// FIX: validateTwilio added — was missing, anyone could hit this endpoint
+// FIX CRITICAL: <Connect><Stream> replaces <Start><Stream>
+// <Start><Stream> = non-blocking, receive-only — injected audio is DROPPED
+// <Connect><Stream> = blocking, bidirectional — agent CAN speak to caller
 router.post('/answered', validateTwilio, (req, res) => {
   const callSid     = req.body.CallSid || 'unknown';
   const callerPhone = req.body.To      || 'unknown';
 
-  logger.info('Outbound call answered', { callSid });
+  logger.info('📞 Outbound call answered - connecting to WebSocket stream', {
+    callSid,
+    callerPhone: '***' + String(callerPhone).slice(-4),
+  });
 
-  const twiml  = new twilio.twiml.VoiceResponse();
-  const start  = twiml.start();
-  const stream = start.stream({
-    // FIX CRITICAL: use req.headers.host — always correct regardless of BASE_URL format
-    // BASE_URL may have https://, trailing path, or port that breaks wss:// construction
-    // req.headers.host is always just the hostname:port Twilio actually connected to
+  const twiml   = new twilio.twiml.VoiceResponse();
+  // FIX: connect() not start() — bidirectional audio requires <Connect><Stream>
+  const connect = twiml.connect();
+  const stream  = connect.stream({
+    // FIX: use req.headers.host — always correct regardless of BASE_URL format
     url: `wss://${req.headers.host}/call/stream`,
   });
   stream.parameter({ name: 'callerPhone', value: callerPhone });
   stream.parameter({ name: 'callSid',     value: callSid });
-
-  // Single long pause — WebSocket or handleCallEnd() ends the call before this expires
-  twiml.pause({ length: 3600 });
+  // NOTE: No twiml.pause() needed — <Connect> is blocking; call stays alive
+  // until the WebSocket closes or handleCallEnd() sends <Hangup>
 
   res.type('text/xml').send(twiml.toString());
 });
 
 // ── POST /call/incoming — inbound (for testing / demo) ────────
+// FIX CRITICAL: same <Connect><Stream> fix applied here
 router.post('/incoming', validateTwilio, (req, res) => {
   const callSid     = req.body.CallSid || 'unknown';
   const callerPhone = req.body.From    || 'unknown';
 
-  logger.info('Inbound call', { callSid });
+  logger.info('📱 Inbound call - connecting to WebSocket stream', {
+    callSid,
+    callerPhone: '***' + String(callerPhone).slice(-4),
+  });
 
-  const twiml  = new twilio.twiml.VoiceResponse();
-  const start  = twiml.start();
-  const stream = start.stream({
+  const twiml   = new twilio.twiml.VoiceResponse();
+  const connect = twiml.connect();
+  const stream  = connect.stream({
     url: `wss://${req.headers.host}/call/stream`,
   });
   stream.parameter({ name: 'callerPhone', value: callerPhone });
   stream.parameter({ name: 'callSid',     value: callSid });
-
-  twiml.pause({ length: 3600 });
 
   res.type('text/xml').send(twiml.toString());
 });
@@ -91,15 +105,17 @@ router.post('/incoming', validateTwilio, (req, res) => {
 router.post('/voicemail', validateTwilio, async (req, res) => {
   const { CallSid, AnsweredBy } = req.body;
 
-  logger.info('Answering machine detected', { CallSid, AnsweredBy });
+  logger.warn('🤖 Answering machine detected', { CallSid, AnsweredBy });
   await incrementMetric('voicemails');
 
   if (process.env.ENABLE_VOICEMAIL_MESSAGE !== 'true') {
+    logger.debug('⚠️  Voicemail message disabled - hanging up', { CallSid });
     return res.type('text/xml').send('<Response><Hangup/></Response>');
   }
 
   const callbackNumber = process.env.LONO_CALLBACK_NUMBER || process.env.TWILIO_PHONE_NUMBER;
 
+  logger.info('📞 Playing voicemail message with callback number', { callbackNumber });
   const twiml = new twilio.twiml.VoiceResponse();
   twiml.say(
     { voice: 'Polly.Aditi', language: 'en-IN' },
@@ -114,26 +130,41 @@ router.post('/voicemail', validateTwilio, async (req, res) => {
 router.post('/status', validateTwilio, async (req, res) => {
   const { CallSid, CallStatus, To, AnsweredBy, CallDuration } = req.body;
 
-  logger.info('Call status', { CallSid, CallStatus, AnsweredBy, duration: CallDuration });
+  logger.info('📊 Call status update', {
+    CallSid,
+    CallStatus,
+    callerPhone: '***' + String(To).slice(-4),
+    duration:   CallDuration,
+    answeredBy: AnsweredBy,
+  });
 
   if (CallStatus === 'answered') {
+    logger.info('✅ Call answered - incrementing metric', { CallSid });
     await incrementMetric('calls_answered');
   }
 
   if (['no-answer', 'busy', 'failed'].includes(CallStatus) && To) {
+    logger.warn(`⚠️  Call ${CallStatus} - checking retry policy`, {
+      CallSid,
+      callerPhone: '***' + String(To).slice(-4),
+    });
     const retries    = await getRetryCount(To);
     const maxRetries = parseInt(process.env.MAX_RETRIES_PER_NUMBER) || 1;
 
     if (retries < maxRetries) {
+      logger.info('📋 Enqueueing retry', {
+        callerPhone: '***' + String(To).slice(-4),
+        attempt:    retries + 1,
+        maxRetries,
+        reason:     CallStatus,
+      });
       await enqueueRetry(To, Date.now() + 30 * 60 * 1000);
       await incrementRetryCount(To);
-      logger.info('Retry enqueued', {
-        phone:   '***' + String(To).slice(-4),
-        attempt: retries + 1,
-        reason:  CallStatus,
-      });
     } else {
-      logger.info('Max retries reached', { phone: '***' + String(To).slice(-4) });
+      logger.warn('🔴 Max retries reached - sending missed call alert', {
+        callerPhone:   '***' + String(To).slice(-4),
+        totalAttempts: retries + 1,
+      });
       await sendMissedCallAlert(To);
     }
   }
@@ -145,12 +176,15 @@ router.post('/status', validateTwilio, async (req, res) => {
 router.get('/metrics', async (req, res) => {
   const key = req.headers['x-api-key'];
   if (!key || key !== process.env.ADMIN_API_KEY) {
+    logger.warn('🚨 Unauthorized metrics request', { ip: req.ip });
     return res.status(401).json({ error: 'Unauthorized' });
   }
   try {
+    logger.info('📊 Fetching metrics', { ip: req.ip });
     const metrics = await getMetrics();
     res.json({ ok: true, metrics });
   } catch (err) {
+    logger.error('❌ Metrics fetch failed', { error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
@@ -159,8 +193,10 @@ router.get('/metrics', async (req, res) => {
 router.get('/leads', (req, res) => {
   const key = req.headers['x-api-key'];
   if (!key || key !== process.env.ADMIN_API_KEY) {
+    logger.warn('🚨 Unauthorized leads request', { ip: req.ip });
     return res.status(401).json({ error: 'Unauthorized' });
   }
+  logger.info('📋 Returning leads Google Sheets URL', { ip: req.ip });
   res.json({
     sheetsUrl: `https://docs.google.com/spreadsheets/d/${process.env.GOOGLE_SHEETS_ID}`,
     tabs:      ['All Calls', 'Hot Leads'],
