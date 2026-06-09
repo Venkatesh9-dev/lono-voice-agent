@@ -27,8 +27,9 @@ const IDLE_TIMEOUT_MS  = (parseInt(process.env.IDLE_TIMEOUT_SECONDS) || 25) * 10
 const MIN_TRANSCRIPT   = 3;
 
 // ── VAD tuning ────────────────────────────────────────────────
-const SILENCE_THRESHOLD_RMS = 80; // RMS energy below this = silence
-const MIN_SPEECH_MS          = 300; // skip utterances shorter than this
+// Start very low — we need the energy log below to calibrate for this phone line
+const SILENCE_THRESHOLD_RMS = 50;  // raise if noise triggers false positives
+const MIN_SPEECH_MS          = 200; // skip utterances shorter than this
 const SILENCE_TO_END_MS      = 800; // silence duration to flush utterance
 
 // ── BYE detection (all three languages) ──────────────────────
@@ -218,6 +219,10 @@ function setupStreamHandler(wss) {
     let isSpeaking     = false;
     let vadTimer       = null;
 
+    // Diagnostic: track frame count and peak energy seen
+    let frameCount   = 0;
+    let peakEnergy   = 0;
+
     // ── Idle timer ────────────────────────────────────────────
     function resetIdleTimer() {
       clearTimeout(idleTimer);
@@ -239,6 +244,26 @@ function setupStreamHandler(wss) {
 
     // ── VAD: receive one 20 ms µ-law frame ────────────────────
     async function onAudioFrame(audioData) {
+      frameCount++;
+      const energy = getRmsEnergy(audioData);
+
+      // Track peak energy
+      if (energy > peakEnergy) peakEnergy = energy;
+
+      // DIAGNOSTIC: log energy every 200 frames (~4 seconds)
+      // Use this to calibrate SILENCE_THRESHOLD_RMS for this phone line
+      if (frameCount % 200 === 0) {
+        logger.info('🔊 Audio energy sample', {
+          callSid,
+          currentEnergy: Math.round(energy),
+          peakEnergy:    Math.round(peakEnergy),
+          threshold:     SILENCE_THRESHOLD_RMS,
+          isSpeaking,
+          isProcessing,
+          frames:        frameCount,
+        });
+      }
+
       if (isProcessing || sessionEnded) return;
 
       const energy = getRmsEnergy(audioData);
