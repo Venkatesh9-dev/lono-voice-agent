@@ -27,7 +27,7 @@ const IDLE_TIMEOUT_MS  = (parseInt(process.env.IDLE_TIMEOUT_SECONDS) || 25) * 10
 const MIN_TRANSCRIPT   = 3;
 
 // ── VAD tuning ────────────────────────────────────────────────
-const SILENCE_THRESHOLD_RMS = 250; // RMS energy below this = silence
+const SILENCE_THRESHOLD_RMS = 80; // RMS energy below this = silence
 const MIN_SPEECH_MS          = 300; // skip utterances shorter than this
 const SILENCE_TO_END_MS      = 800; // silence duration to flush utterance
 
