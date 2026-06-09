@@ -266,8 +266,6 @@ function setupStreamHandler(wss) {
 
       if (isProcessing || sessionEnded) return;
 
-      const energy = getRmsEnergy(audioData);
-
       if (energy > SILENCE_THRESHOLD_RMS) {
         if (!isSpeaking) {
           isSpeaking   = true;
